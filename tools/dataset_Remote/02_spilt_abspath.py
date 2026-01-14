@@ -5,7 +5,6 @@ from collections import defaultdict
 from pathlib import Path
 
 '''
-    v0.1.1 2025.10.25 @Gemini
     修正：使用 Path(__file__) 来定位项目根目录，确保绝对路径始终正确。
     (原始脚本逻辑依赖于 CWD，会导致路径错误)
 '''
