@@ -159,7 +159,7 @@ python ./tools/dataset_Remote/06_eval_statistics.py \
 
 ---
 
-### 4. Open-ended 任务评测（无指令动态匹配）
+### 4. Open-ended 任务评测
 
 ```bash
 python ./tools/dataset_Remote/07_eval_statistics_open_ended.py
