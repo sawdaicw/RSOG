@@ -173,7 +173,7 @@ python ./tools/dataset_Remote/07_eval_statistics_open_ended.py
 
 ### Step 1：推理检测
 
-1. 修改 `instruction.py` 与 `eval_instruction.py` 中的模型 API
+1. 修改 `instruction_processor.py` 与 `eval_instruction.py` 中的模型 API
 2. 修改 `eval_instruction.py` 中的图片路径（需使用绝对路径）
 
 ```bash
