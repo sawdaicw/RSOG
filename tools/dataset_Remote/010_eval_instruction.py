@@ -1,0 +1,294 @@
+
+import os
+import sys
+# 1. 获取当前 05_eval.py 文件的绝对路径
+current_file = os.path.abspath(__file__)  # 结果是：/home/zhiwei/FT_data/Qwen2.5-VL-FT-Remote/tools/dataset_Remote/05_eval.py
+# 2. 从当前文件向上跳 3 级，定位到项目根目录（根目录下有 tools 文件夹）
+project_root = os.path.abspath(os.path.join(current_file, "../../.."))  # 结果是：/home/zhiwei/FT_data/Qwen2.5-VL-FT-Remote/
+# 3. 把根目录加入 Python 搜索路径
+sys.path.append(project_root)
+import json
+from typing import List
+from tqdm import tqdm
+from pathlib import Path
+from typing import List, Dict
+import os
+import json
+from PIL import Image
+import base64
+from io import BytesIO
+from openai import OpenAI
+from tools.bbox_detector import BBoxDetector
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+from tools.instruction_processor import InstructionProcessor
+
+
+class BBoxEvaluator:
+    def __init__(
+        self, 
+        image_list_path: str, 
+        class_list: List[str], 
+        output_dir: str = "./results/eval_qwen_instruction/labels",
+        task_config: str = "fixed",  # "fixed" or "open" or "open_ended"
+        instructions_path: str = None  # Path to instructions JSON file
+    ):
+        """
+        Initialize the evaluator
+        
+        :param image_list_path: Path to text file containing image paths (one per line)
+        :param class_list: List of classes to detect (used when task_config is "fixed")
+        :param output_dir: Directory to save JSON results (default: ./results/eval/labels)
+        :param task_config: "fixed" for fixed classes or "open" for open classes
+        :param instructions_path: Path to JSON file containing instructions (for open_ended task)
+        """
+        self.image_list_path = image_list_path
+        self.class_list = class_list
+        self.task_config = task_config.lower()
+        self.instructions_path = instructions_path
+        
+        if self.task_config not in ["fixed", "open", "open_ended"]:
+            raise ValueError("task_config must be either 'fixed', 'open', or 'open_ended'")
+            
+        # Define open classes if needed
+        if self.task_config == "open":
+            self.class_list = [
+                "facility",
+                "structure",
+                "passenger vehicle",
+                "transportation",
+                "cargo truck ",
+                "heavy vehicle"
+            ]
+        
+        self.detector = BBoxDetector()
+        self.output_dir = f"{output_dir}/{self.detector.config['model_name']}/{self.task_config}"
+
+        target_api_base = "http://localhost:8015/v1"
+        target_model_name = "/home/zirui/.cursor-server/Qwen2.5-VL-FT-Remote/export_v5_11968"
+
+        self.instruction_processor = InstructionProcessor(
+            model_api_base=target_api_base, 
+            model_name=target_model_name
+        )
+        
+        # 同时顺便修正 detector 的配置，防止它内部其他地方调用出错
+        if "api_base" in self.detector.config:
+             self.detector.config["api_base"] = target_api_base
+        
+        # Load instructions if open_ended task
+        if self.task_config == "open_ended":
+            if not instructions_path:
+                raise ValueError("instructions_path must be provided for open_ended task")
+            with open(instructions_path) as f:
+                self.instructions = json.load(f)
+            # Create mapping from image path to instruction for faster lookup
+            self.instruction_map = {item['image_path']: item for item in self.instructions}
+            
+        
+        # Create output directory if it doesn't exist
+        os.makedirs(self.output_dir, exist_ok=True)
+    
+    def generate_prompt(self, class_name: str = None, instruction_data: dict = None) -> str:
+        """Generate the detection prompt for a given class or for open detection"""
+        if self.task_config == "fixed":
+            return (
+                f"""This is aerial image, detect {class_name} in the image and return bounding boxes in JSON format and no other outputs."""
+                """e.g.[
+                    {"bbox_2d": [x1, y1, x2, y2], "label": "object_type"},   
+                    {"bbox_2d": [x1, y1, x2, y2], "label": "object_type"}, ]"""
+            )
+        elif self.task_config == "open":
+            return (
+                f"""This is aerial image, detect {class_name} in the image and return bounding boxes in JSON format and no other outputs."""
+                """e.g.[
+                    {"bbox_2d": [x1, y1, x2, y2], "label": "object_type"},   
+                    {"bbox_2d": [x1, y1, x2, y2], "label": "object_type"}, ]"""
+            )
+        elif self.task_config == "open_ended":
+            if not instruction_data:
+                raise ValueError("instruction_data must be provided for open_ended task")
+            
+            raw_instruction = instruction_data.get('instruction', '')
+            print(raw_instruction)
+            with self.instruction_processor as processor:
+                process_result, processed_instruction = processor.process(raw_instruction)
+            if self.detector.config["model_name"] == "Qwen/Qwen2.5-VL-7B-Instruct":
+                print(processed_instruction)
+                return f"""
+                Mission Instruction: {processed_instruction}            
+                Analyze this aerial image and detect all objects according to the mission instruction.
+                Return the bounding boxes in JSON format with labels and no other outputs. 
+                Example format:
+                [
+                    {{"bbox_2d": [x1, y1, x2, y2], "label": "object_type"}},
+                    {{"bbox_2d": [x3, y3, x4, y4], "label": "object_type"}}
+                    ...(do not output the same bounding box multiple times)
+                ]
+                """
+            else:
+                return f"""
+                Mission Instruction: {processed_instruction}            
+                Analyze this aerial image and detect all objects according to the mission instruction.
+                Return the bounding boxes in JSON format with labels and no other outputs.
+                Example format:
+                [
+                    {{"bbox_2d": [x1, y1, x2, y2], "label": "object_type"}},
+                    {{"bbox_2d": [x3, y3, x4, y4], "label": "object_type"}}
+                    ...
+                ]
+                """
+    
+    def process_image(self, image_path: str) -> dict:
+        """
+        Process a single image and detect all classes
+        
+        :param image_path: Path to the image file
+        :return: Dictionary containing all detection results for the image
+        """
+        results = {
+            "image_path": image_path, 
+            "detections": {}, 
+            "task_config": self.task_config
+        }
+        
+        if self.task_config == "fixed":
+            for class_name in self.class_list:
+                prompt = self.generate_prompt(class_name)
+                detection_result = self.detector.detect(image_path, prompt)
+                
+                if "bboxes" in detection_result:
+                    results["detections"][class_name] = detection_result["bboxes"]
+                else:
+                    results["detections"][class_name] = []
+                    print(f"Warning: Failed to detect {class_name} in {image_path}")
+                    
+        elif self.task_config == "open":
+            for class_name in self.class_list:
+                prompt = self.generate_prompt(class_name)
+                detection_result = self.detector.detect(image_path, prompt)
+                
+                if "bboxes" in detection_result:
+                    results["detections"][class_name] = detection_result["bboxes"]
+                else:
+                    results["detections"][class_name] = []
+                    print(f"Warning: Failed to detect {class_name} in {image_path}")
+                    
+        elif self.task_config == "open_ended":
+            # Get instruction data for this image
+            instruction_data = self.instruction_map.get(image_path)
+            if not instruction_data:
+                print(f"Warning: No instruction found for image {image_path}")
+                return results
+                
+            # Add instruction metadata to results
+            results.update({
+                "instruction": instruction_data.get('instruction'),
+                "dataset_type": instruction_data.get('dataset_type'),
+                "gt_object": instruction_data.get('objects')
+            })
+
+            # Generate and run prompt
+            prompt = self.generate_prompt(instruction_data=instruction_data)
+            print(prompt)
+            detection_result = self.detector.detect(image_path, prompt)
+            print(detection_result)
+            
+            if "bboxes" in detection_result:
+                results["detections"] = detection_result["bboxes"]
+                if "object" in detection_result:
+                    results["object"] = detection_result["object"]
+            else:
+                results["detections"] = []
+                print(f"Warning: Failed to detect objects in {image_path}")
+            
+        print(results)
+        return results
+    
+    def save_results(self, image_path: str, results: dict):
+        """
+        Save detection results to JSON file
+        
+        :param image_path: Original image path
+        :param results: Detection results dictionary
+        """
+        # Get image name without extension
+        image_name = Path(image_path).stem
+        output_path = os.path.join(self.output_dir, f"{image_name}.json")
+        
+        # Custom JSON formatting function
+        def format_json(data, indent=2):
+            if isinstance(data, list) and all(isinstance(x, list) and len(x) == 4 for x in data):
+                # If it's a bbox coordinate list, output compactly
+                return json.dumps(data, separators=(',', ':'))
+            elif isinstance(data, dict):
+                # If it's a dictionary, process recursively
+                return "{\n" + ",\n".join(
+                    f'{" "*indent}"{k}": {format_json(v, indent+2)}'
+                    for k, v in data.items()
+                ) + "\n" + " "*(indent-2) + "}"
+            else:
+                # Normal output for other cases
+                return json.dumps(data)
+        
+        with open(output_path, 'w') as f:
+            formatted_json = format_json(results)
+            f.write(formatted_json)
+    
+    def run_evaluation(self):
+        """Run evaluation on all images in the list"""
+        # Read image list
+        with open(self.image_list_path) as f:
+            image_paths = [line.strip() for line in f if line.strip()]
+        
+        # Process each image
+        for image_path in tqdm(image_paths, desc="Processing images"):
+            if not os.path.exists(image_path):
+                print(f"Warning: Image not found - {image_path}")
+                continue
+            
+            try:
+                with self.detector:
+                    results = self.process_image(image_path)
+                    self.save_results(image_path, results)
+            except Exception as e:
+                print(f"Error processing {image_path}: {str(e)}")
+                continue
+
+if __name__ == "__main__":
+    # ================= 配置区域 =================
+    
+    # 1. 测试单张图片的路径
+    target_image_path = "/home/zirui/.cursor-server/Qwen2.5-VL-FT-Remote/datasets/VLAD_Remote/VisDrone/VisDrone2019-DET-train/images/9999955_00000_d_0000064.jpg"
+    
+    # 2. 指令文件路径
+    INSTRUCTIONS_PATH = "./tools/dataset_Remote/instructions_with_objects.json"
+    
+    # ===========================================
+
+    # 3. 创建一个临时的 txt 文件来存放这张图片的路径
+    temp_list_file = "temp_single_test_list.txt"
+    with open(temp_list_file, "w") as f:
+        f.write(target_image_path)
+
+    print(f"🚀 正在针对单张图片进行评测: {target_image_path}")
+
+    # 4. 初始化评估器
+    try:
+        open_evaluator = BBoxEvaluator(
+            image_list_path=temp_list_file,  
+            class_list=[], 
+            task_config="open_ended",
+            instructions_path=INSTRUCTIONS_PATH
+        )
+        
+        # 5. 运行
+        open_evaluator.run_evaluation()
+        
+    except Exception as e:
+        print(f"❌ 运行出错: {e}")
+    
+    finally:
+        # 运行完删除临时文件，保持目录整洁
+        if os.path.exists(temp_list_file):
+            os.remove(temp_list_file)
+            print("🧹 临时列表文件已清理")
